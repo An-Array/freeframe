@@ -110,8 +110,8 @@ def verify_magic_code(body: VerifyMagicCodeRequest, db: Session = Depends(get_db
     needs_password = user.password_hash is None
     
     return TokenResponse(
-        access_token=create_access_token(str(user.id)),
-        refresh_token=create_refresh_token(str(user.id)),
+        access_token=create_access_token(str(user.id), token_version=user.token_version),
+        refresh_token=create_refresh_token(str(user.id), token_version=user.token_version),
         needs_password=needs_password,
     )
 
@@ -172,8 +172,8 @@ def accept_invite(body: AcceptInviteRequest, db: Session = Depends(get_db)):
     db.commit()
     
     return TokenResponse(
-        access_token=create_access_token(str(user.id)),
-        refresh_token=create_refresh_token(str(user.id)),
+        access_token=create_access_token(str(user.id), token_version=user.token_version),
+        refresh_token=create_refresh_token(str(user.id), token_version=user.token_version),
         needs_password=False,
     )
 
@@ -208,8 +208,8 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     ):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     return TokenResponse(
-        access_token=create_access_token(str(user.id)),
-        refresh_token=create_refresh_token(str(user.id)),
+        access_token=create_access_token(str(user.id), token_version=user.token_version),
+        refresh_token=create_refresh_token(str(user.id), token_version=user.token_version),
         needs_password=False,
     )
 
@@ -222,9 +222,11 @@ def refresh_token(body: RefreshRequest, db: Session = Depends(get_db)):
     user = get_user_by_id(db, uuid.UUID(payload["sub"]))
     if not user or user.status == UserStatus.deactivated:
         raise HTTPException(status_code=401, detail="User not found")
+    if payload.get("ver", 1) != user.token_version:
+        raise HTTPException(status_code=401, detail="Session expired, please log in again")
     return TokenResponse(
-        access_token=create_access_token(str(user.id)),
-        refresh_token=create_refresh_token(str(user.id)),
+        access_token=create_access_token(str(user.id), token_version=user.token_version),
+        refresh_token=create_refresh_token(str(user.id), token_version=user.token_version),
         needs_password=user.password_hash is None,
     )
 
@@ -251,7 +253,7 @@ def update_preferences(
     db.refresh(current_user)
     return current_user
 
-@router.patch("/change-password", status_code=status.HTTP_200_OK)
+@router.patch("/change-password", response_model=TokenResponse, status_code=status.HTTP_200_OK)
 def change_password(
     body: ChangePasswordRequest,
     db: Session = Depends(get_db),
@@ -264,5 +266,11 @@ def change_password(
         raise HTTPException(status_code=400, detail="Current password is incorrect")
 
     current_user.password_hash = hash_password(body.new_password)
+    current_user.token_version += 1
     db.commit()
-    return {"message": "Password changed successfully"}
+    db.refresh(current_user)
+    return TokenResponse(
+        access_token=create_access_token(str(current_user.id), token_version=current_user.token_version),
+        refresh_token=create_refresh_token(str(current_user.id), token_version=current_user.token_version),
+        needs_password=False,
+    )
