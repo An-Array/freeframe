@@ -187,6 +187,9 @@ For **non-AWS S3-compatible providers** (R2, B2, Spaces, MinIO, Hetzner, …), s
 | Backblaze B2 | `https://s3.<region>.backblazeb2.com` |
 | DigitalOcean Spaces | `https://<region>.digitaloceanspaces.com` |
 | MinIO (self-hosted) | `http://your-minio-host:9000` |
+| Garage (self-hosted) | `http://your-garage-host:3900` (or your reverse-proxy URL) |
+
+In non-AWS mode FreeFrame always uses **path-style addressing** (`endpoint/bucket/key`) with **SigV4** signatures — the compatibility baseline every S3-compatible provider accepts. No wildcard bucket DNS is needed in front of a self-hosted store.
 
 #### Bucket CORS — required for uploads
 
@@ -203,6 +206,8 @@ Uploads go **directly from the browser to your bucket** via presigned URLs, so t
   }]
 }
 ```
+
+If you allow **more than one origin**, give each origin its own rule rather than listing them all in one. Some backends (Garage) answer a multi-origin rule by joining every entry into a single comma-separated `Access-Control-Allow-Origin` header, which browsers reject — every upload and HLS segment fetch then fails CORS. FreeFrame's automatic startup config already emits one rule per origin.
 
 FreeFrame applies this automatically to **non-AWS** buckets at startup when it has permission (and logs a warning if it can't). Set it yourself for **AWS S3**, or wherever FreeFrame lacks CORS permission. **Hetzner Object Storage** exposes CORS only via API/CLI (not the Console UI), so it's easy to miss — apply the JSON above with `aws s3api put-bucket-cors`.
 

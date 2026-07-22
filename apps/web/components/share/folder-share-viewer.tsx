@@ -19,6 +19,8 @@ import {
   ArrowLeft,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { useReview, type CreateCommentPayload } from '@/components/review/review-provider'
+import { useReviewStore } from '@/stores/review-store'
 import type {
   SharePermission,
   ShareLinkAppearance,
@@ -791,14 +793,9 @@ function ShareReviewInner({
   token, shareSession, assetName, permission, allowDownload, showVersions, onBack,
   VideoPlayer, ImageViewer, AudioPlayer, CommentPanel, CommentInput, VersionSwitcher,
 }: any) {
-  // Import hooks from the review system
-  const { useReview } = require('@/components/review/review-provider')
-  const { useReviewStore } = require('@/stores/review-store')
-  const { useComments } = require('@/hooks/use-comments')
-
   const { asset, versions, isLoading, comments, refetchComments, addComment } = useReview()
   const { currentVersion, isDrawingMode, focusedCommentId } = useReviewStore()
-  const [sidebarOpen, setSidebarOpen] = React.useState(true)
+  const [sidebarOpen, setSidebarOpen] = React.useState(() => typeof window !== 'undefined' && window.matchMedia('(min-width: 768px)').matches)
   const [activeTab, setActiveTab] = React.useState<'comments' | 'fields'>('comments')
   const [AnnotationOverlay, setAnnotationOverlay] = React.useState<any>(null)
   const [AnnotationCanvas, setAnnotationCanvas] = React.useState<any>(null)
@@ -829,7 +826,7 @@ function ShareReviewInner({
   const isLoggedIn = typeof window !== 'undefined' && !!localStorage.getItem('ff_access_token')
 
   const submitComment = React.useCallback(async (body: string, timecodeStart?: number, timecodeEnd?: number, annotationData?: Record<string, unknown>) => {
-    const payload: Record<string, unknown> = { body }
+    const payload: CreateCommentPayload = { body }
     if (currentVersion?.id) payload.version_id = currentVersion.id
     if (timecodeStart != null) payload.timecode_start = timecodeStart
     if (timecodeEnd != null) payload.timecode_end = timecodeEnd
@@ -882,7 +879,7 @@ function ShareReviewInner({
       </div>
 
       {/* Main: viewer + sidebar */}
-      <div className="flex flex-1 overflow-hidden min-h-0">
+      <div className="relative flex flex-1 overflow-hidden min-h-0">
         {/* Media viewer — reuses project components */}
         <div className="flex-1 flex flex-col bg-bg-primary overflow-hidden min-w-0">
           {asset.asset_type === 'video' && versionReady && VideoPlayer ? (
@@ -922,7 +919,7 @@ function ShareReviewInner({
 
         {/* Right sidebar — reuses project comment panel */}
         {sidebarOpen && (
-          <div className="w-[360px] flex flex-col border-l border-border bg-bg-secondary shrink-0">
+          <div className="w-full md:w-[360px] absolute inset-y-0 right-0 z-20 md:static md:inset-auto flex flex-col border-l-0 md:border-l border-border bg-bg-secondary shrink-0">
             <div className="px-4 pt-3 pb-2 shrink-0">
               <div className="flex items-center bg-bg-tertiary rounded-lg p-0.5">
                 <button onClick={() => setActiveTab('comments')} className={`flex-1 py-1.5 text-[13px] font-medium rounded-md transition-all ${activeTab === 'comments' ? 'bg-bg-hover text-text-primary shadow-sm' : 'text-text-tertiary'}`}>
@@ -1048,7 +1045,7 @@ export function FolderShareViewer({
   const [searchQuery, setSearchQuery] = React.useState('')
   const [foldersExpanded, setFoldersExpanded] = React.useState(true)
   const [assetsExpanded, setAssetsExpanded] = React.useState(true)
-  const [panelOpen, setPanelOpen] = React.useState(true)
+  const [panelOpen, setPanelOpen] = React.useState(() => typeof window !== 'undefined' && window.matchMedia('(min-width: 768px)').matches)
   const [viewingAsset, setViewingAsset] = React.useState<FolderShareAssetItem | null>(null)
 
   // Set page title
@@ -1349,7 +1346,7 @@ export function FolderShareViewer({
       </header>
 
       {/* ─── Content area ──────────────────────────────────────────────── */}
-      <div className="flex flex-1 overflow-hidden">
+      <div className="relative flex flex-1 overflow-hidden">
         {/* ─── Left: folder contents ─────────────────────────────────── */}
         <div className="flex-1 flex flex-col overflow-hidden">
           {/* Sub-header: title, summary, breadcrumb, search */}
@@ -1578,7 +1575,7 @@ export function FolderShareViewer({
 
         {/* ─── Right Panel ───────────────────────────────────────────── */}
         {panelOpen && (
-          <div className="w-[320px] shrink-0 border-l border-border bg-bg-secondary flex flex-col overflow-hidden">
+          <div className="w-full md:w-[320px] absolute inset-y-0 right-0 z-20 md:static md:inset-auto flex flex-col border-l-0 md:border-l border-border bg-bg-secondary shrink-0 overflow-hidden">
             <RightPanel
               selectedAsset={selectedAsset}
               token={token}

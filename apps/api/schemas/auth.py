@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, field_validator, Field
 import uuid
 from ..models.user import UserStatus
 
@@ -32,6 +32,14 @@ class UserResponse(BaseModel):
     preferences: dict = {}
 
     model_config = {"from_attributes": True}
+
+    @field_validator("avatar_url", mode="after")
+    @classmethod
+    def resolve_avatar_url(cls, v: str | None) -> str | None:
+        if v and not v.startswith("http"):
+            from ..services import s3_service
+            return s3_service.generate_presigned_get_url(v)
+        return v
 
 class InviteRequest(BaseModel):
     email: EmailStr
