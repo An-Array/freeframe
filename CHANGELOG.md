@@ -13,6 +13,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Password changes now revoke all other sessions by incrementing token version; current session receives fresh tokens to stay logged in.
 
+## [1.7.4] - 2026-07-23
+
+### Fixed
+- **A superadmin can no longer delete or deactivate their own account and get irrecoverably locked out** — `DELETE /users/{id}` gained the same self-protection `PATCH /admin/users/{id}/deactivate` already had. Removed two duplicate, unused endpoints (`/users/{id}/deactivate`, `/users/{id}/reactivate`) that had no such guard and no frontend caller — the admin dashboard already uses the correctly-guarded `/admin/users/{id}/...` versions.
+- **`/auth/login` is now rate-limited** (10 attempts / 10 minutes per IP) — previously only the generic global write limiter (300/minute) backed password login.
+- **`/auth/verify-magic-code` no longer reveals whether an email is registered or deactivated** — an unknown email, a deactivated account, and a wrong code now all return the same generic 401, matching how `/auth/login` already avoids this.
+- **Internal-visibility comments no longer reach public share links** — a comment (or reply, at any thread depth) marked "internal" is team-only by design, but the guest share endpoints didn't filter on visibility at all.
+- **`@mention`ing a user in a comment now requires that user to actually have access to the asset** — previously any mentioned user id (or parsed `@email`) got a real notification and email with the asset name and a comment preview, regardless of whether they could see the asset at all.
+- **Replying to a comment now checks the parent comment belongs to the same asset** — `POST /assets/{id}/comments/{comment_id}/replies` looked up the parent by id alone, so a comment id from an unrelated asset (including one the caller has no access to) would be accepted, letting a caller both probe whether an arbitrary comment id exists and inject a reply into a thread on an asset they can't see.
+- **`POST /assets/{id}/comments` now validates that `version_id` actually belongs to the asset** — previously accepted unchecked, which could create a comment whose `asset_id` and `version_id` referred to two different assets.
+
+## [1.7.3] - 2026-07-23
+
+### Fixed
+- **Public share-link comments can no longer read or write outside the shared scope** — both `GET /share/{token}/comments` and `POST /share/{token}/comment` trusted a client-supplied `asset_id` for folder/project-scoped links (and, for the write endpoint, even for a single-asset link — a request body could name a different asset entirely) with no check that the asset was actually within the link's scope. A holder of any comment/approve-permission share link could read or post comments on assets never shared with them. Both endpoints now validate the resolved asset against the share link the same way every other public share endpoint already does.
+- **Password-protected share links now actually gate comments** — the two comment endpoints were the only public share routes that skipped password/session verification, so a password-protected link's comments were fully readable and writable with just the token.
+
+## [1.7.2] - 2026-07-23
+
+### Fixed
+- **`GET /users` and `GET /users/search` no longer expose pending invite tokens** — both endpoints reused the same response shape as the admin user list, which includes a pending invitee's live `invite_token`. Since either endpoint only required being logged in (not an admin), any authenticated user could look up a pending invitee and read their token, then complete the invite themselves via `/auth/accept-invite` before the real invitee did. The token is now only ever returned by the admin-gated `GET /admin/users` and `POST /users/invite` responses.
+- **Removed the legacy `POST /auth/register` endpoint** — it created an immediately-active, loginable account for any email with no auth and no invite check, bypassing the invite-only model this platform is built around. It had no frontend caller; account creation now only happens via an admin invite (`/users/invite` → `/auth/accept-invite`), first-time setup (`/setup/create-superadmin`), or a sign-in code sent to an already-known email (`/auth/send-magic-code`).
+
+## [1.7.1] - 2026-07-23
+
+### Fixed
+- **Sign-in codes are no longer issued to uninvited emails** — `POST /auth/send-magic-code` used to create and, on verification, fully activate an account for any email address, whether or not an admin had invited it. Only an existing user (already active, or already invited via `POST /users/invite`) can now receive a working code; an unrecognized email gets the same generic response, so the endpoint still doesn't reveal which emails are registered.
+
 ## [1.7.0] - 2026-07-21
 
 ### Upgrade notes

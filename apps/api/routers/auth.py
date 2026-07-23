@@ -5,7 +5,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from ..database import get_db
 from ..schemas.auth import (
-    RegisterRequest, LoginRequest, TokenResponse,
+    LoginRequest, TokenResponse,
     RefreshRequest, UserResponse, InviteRequest,
     SendMagicCodeRequest, SendMagicCodeResponse,
     VerifyMagicCodeRequest, SetPasswordRequest,
@@ -40,28 +40,21 @@ def _generate_invite_token() -> str:
 @router.post("/send-magic-code", response_model=SendMagicCodeResponse, dependencies=[Depends(rate_limit("send_magic_code", 5, 600))])
 def send_magic_code(body: SendMagicCodeRequest, db: Session = Depends(get_db)):
     """
-    Send magic code to email.
-    - If user exists: send code for login
-    - If user doesn't exist: create pending user and send code
+    Send magic code to an existing user's email, for login.
+
+    Does not create accounts: only an admin invite (/users/invite) or
+    /setup/create-superadmin may provision a new user. An unrecognized email
+    gets the same response as a known one, so this endpoint can't be used to
+    enumerate registered emails.
     """
     user = get_user_by_email(db, body.email)
-    
+
     if not user:
-        # Check if this is the first user (becomes super admin)
-        user_count = db.query(User).filter(User.deleted_at.is_(None)).count()
-        is_first_user = user_count == 0
-        
-        # Create new user in pending_verification status
-        user = User(
+        return SendMagicCodeResponse(
+            message="Magic code sent to your email",
             email=body.email,
-            name=body.email.split("@")[0],  # Temporary name from email
-            status=UserStatus.pending_verification,
-            email_verified=False,
-            is_superadmin=is_first_user,  # First user becomes super admin
         )
-        db.add(user)
-        db.commit()
-    
+
     # Generate and store magic code in Redis
     code = generate_magic_code()
     store_magic_code(body.email, code)
@@ -86,12 +79,11 @@ def verify_magic_code(body: VerifyMagicCodeRequest, db: Session = Depends(get_db
     """
     user = get_user_by_email(db, body.email)
     
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    if user.status == UserStatus.deactivated:
-        raise HTTPException(status_code=401, detail="Account deactivated")
-    
+    # "No such user" and "deactivated" get the same generic failure as a wrong/expired code —
+    # distinguishing them would let a caller enumerate registered or deactivated emails.
+    if not user or user.status == UserStatus.deactivated:
+        raise HTTPException(status_code=401, detail="Invalid or expired code")
+
     # Verify magic code from Redis
     success, error = redis_verify_magic_code(body.email, body.code)
     if not success:
@@ -178,25 +170,7 @@ def accept_invite(body: AcceptInviteRequest, db: Session = Depends(get_db)):
     )
 
 
-@router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def register(body: RegisterRequest, db: Session = Depends(get_db)):
-    """Register with email + password (legacy, prefer magic code flow)."""
-    if get_user_by_email(db, body.email):
-        raise HTTPException(status_code=400, detail="Email already registered")
-    user = User(
-        email=body.email,
-        name=body.name,
-        password_hash=hash_password(body.password),
-        status=UserStatus.active,
-        email_verified=False,  # Not verified until magic code
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
-
-
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=TokenResponse, dependencies=[Depends(rate_limit("login", 10, 600))])
 def login(body: LoginRequest, db: Session = Depends(get_db)):
     """Login with email + password."""
     user = get_user_by_email(db, body.email)
