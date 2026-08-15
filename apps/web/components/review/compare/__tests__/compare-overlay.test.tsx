@@ -1,4 +1,5 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+import { stubGeometry, restoreGeometry } from '@/test/geometry'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useReviewStore } from '@/stores/review-store'
 
@@ -86,6 +87,12 @@ function makeVersion(n: number, status = 'ready') {
   } as never
 }
 
+/**
+ * jsdom does no layout, so an <img> reports 0 for every geometry property.
+ * Describe a laid-out image on the prototypes; ImageFrameConstraint's own
+ * effect then reads it for real. Restored in afterEach.
+ */
+
 function makeComment(id: string, versionId: string, over: Record<string, unknown> = {}) {
   return {
     id, asset_id: 'a1', version_id: versionId, parent_id: null,
@@ -126,6 +133,10 @@ beforeEach(() => {
     unobserve() {}
     disconnect() {}
   })
+})
+
+afterEach(() => {
+  restoreGeometry()
 })
 
 describe('CompareOverlay', () => {
@@ -374,10 +385,88 @@ describe('CompareOverlay per-pane annotation display', () => {
     fireEvent.click(screen.getByText('Fix the color grade'))
 
     const overlay = screen.getByTestId('annotation-overlay')
-    // Same wrapper as pane B's <img> — drawings zoom/pan with the image.
-    expect(overlay.parentElement).toContainElement(screen.getByAltText('v3'))
-    expect(overlay.parentElement).not.toContainElement(screen.getByAltText('v1'))
+    // Inside pane B's image wrapper — drawings zoom/pan with that image, and
+    // pane A never renders it. Asserted from the <img> outwards so it stays
+    // precise regardless of the constraint layers in between.
+    expect(screen.getByAltText('v3').parentElement).toContainElement(overlay)
+    expect(screen.getByAltText('v1').parentElement).not.toContainElement(overlay)
     expect(useReviewStore.getState().activeAnnotation).toBeNull()
+  })
+
+  it('image side-by-side: the annotation layer is pinned to the picture, not the letterboxed pane', () => {
+    searchParamsString = 'compare=v-1&mode=sbs'
+    streamUrl = '/img.webp'
+    // Portrait image rendered at natural size in a wider pane: max-w-full does
+    // not upscale, so 350px of empty pane sits either side of the picture.
+    stubGeometry({
+      naturalWidth: 100, naturalHeight: 200,
+      offsetWidth: 100, offsetHeight: 200, offsetLeft: 350, offsetTop: 100,
+    })
+    commentsByVersion['v-3'] = [
+      makeComment('c9', 'v-3', {
+        timecode_start: null,
+        annotation: { id: 'ann9', comment_id: 'c9', drawing_data: DRAWING },
+      }),
+    ]
+    render(
+      <CompareOverlay asset={asset} versions={[makeVersion(1), makeVersion(3)]} rightVersion={makeVersion(3)} onClose={vi.fn()} />,
+    )
+    fireEvent.click(screen.getByText('Fix the color grade'))
+
+    // #185: previously the overlay filled the whole pane, so the same drawing
+    // landed elsewhere in a pane of a different aspect ratio.
+    expect(screen.getByTestId('annotation-overlay').parentElement).toHaveStyle({
+      position: 'absolute',
+      left: '350px',
+      top: '100px',
+      width: '100px',
+      height: '200px',
+    })
+  })
+
+  it('image side-by-side: pane A pins its overlay to pane A’s own picture', () => {
+    searchParamsString = 'compare=v-1&mode=sbs'
+    streamUrl = '/img.webp'
+    // Baseline both panes share.
+    stubGeometry({
+      naturalWidth: 100, naturalHeight: 200,
+      offsetWidth: 100, offsetHeight: 200, offsetLeft: 350, offsetTop: 100,
+    })
+    commentsByVersion['v-1'] = [
+      makeComment('c1', 'v-1', {
+        timecode_start: null,
+        annotation: { id: 'ann1', comment_id: 'c1', drawing_data: DRAWING },
+      }),
+    ]
+    render(
+      <CompareOverlay asset={asset} versions={[makeVersion(1), makeVersion(3)]} rightVersion={makeVersion(3)} onClose={vi.fn()} />,
+    )
+
+    // Give pane A's picture a landscape shape of its own — letterboxed top and
+    // bottom inside its element box, unlike the shared portrait baseline. The
+    // prototype stub alone cannot distinguish the panes, so without this an
+    // overlay wired to pane B's <img> would satisfy the assertion too.
+    for (const [key, value] of Object.entries({
+      naturalWidth: 400, naturalHeight: 100,
+      offsetWidth: 400, offsetHeight: 200, offsetLeft: 20, offsetTop: 250,
+    })) {
+      Object.defineProperty(screen.getByAltText('v1'), key, { value, configurable: true })
+    }
+    // The constraint measured the baseline at mount; decoding re-measures.
+    fireEvent.load(screen.getByAltText('v1'))
+
+    fireEvent.click(screen.getByLabelText('Toggle left comments'))
+    fireEvent.click(screen.getByText('Fix the color grade'))
+
+    // 4:1 picture inside a 400x200 element box: full width, 50px of band above
+    // and below, offset by where pane A's element sits.
+    expect(screen.getByTestId('annotation-overlay').parentElement).toHaveStyle({
+      position: 'absolute',
+      left: '20px',
+      top: '300px',
+      width: '400px',
+      height: '100px',
+    })
   })
 
   it('wipe: a v2 (right) marker is clipped to the RIGHT of the divider — no bleed onto v1', () => {

@@ -1,7 +1,26 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
+import { stubGeometry, restoreGeometry } from '@/test/geometry'
 import { fireEvent, render, screen, renderHook, act } from '@testing-library/react'
 import { WipeViewer } from '../wipe-viewer'
 import { useSharedTransform } from '../use-shared-transform'
+
+/**
+ * jsdom does no layout, so an <img> reports 0 for every geometry property.
+ * Describe a laid-out image on the prototypes; ImageFrameConstraint's own
+ * effect then reads it for real.
+ */
+
+beforeEach(() => {
+  vi.stubGlobal('ResizeObserver', class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  })
+})
+
+afterEach(() => {
+  restoreGeometry()
+})
 
 function renderWipe() {
   const { result } = renderHook(() => useSharedTransform())
@@ -50,6 +69,66 @@ describe('WipeViewer', () => {
       expect(node.style.clipPath).toBe('')
       node = node.parentElement
     }
+  })
+
+  it('positions the overlay over the picture, not the letterboxed stage (#185)', () => {
+    // Drawings are authored in image-frame space (ImageFrameConstraint in the
+    // single viewer and the side-by-side panes). Wipe display has to use the
+    // SAME space or every annotation shown here is offset by the letterbox.
+    stubGeometry({
+      naturalWidth: 1200, naturalHeight: 400,
+      offsetWidth: 900, offsetHeight: 300, offsetLeft: 0, offsetTop: 100,
+    })
+    const { result } = renderHook(() => useSharedTransform())
+    render(
+      <WipeViewer
+        urlA="/a.webp" urlB="/b.webp" badgeA="v1" badgeB="v3"
+        transform={result.current}
+        overlay={<div data-testid="wipe-overlay" />}
+        overlaySide="b"
+      />,
+    )
+    expect(screen.getByTestId('wipe-overlay').parentElement).toHaveStyle({
+      position: 'absolute',
+      left: '0px',
+      top: '100px',
+      width: '900px',
+      height: '300px',
+    })
+  })
+
+  it('measures the overlay against the version that owns it', () => {
+    // Two versions of an asset can differ in aspect ratio, so the constraint
+    // has to follow overlaySide rather than always measuring the same image.
+    // Baseline geometry (both images): 3:1 letterboxed into a 900x500 stage.
+    stubGeometry({
+      naturalWidth: 1200, naturalHeight: 400,
+      offsetWidth: 900, offsetHeight: 300, offsetLeft: 0, offsetTop: 100,
+    })
+    const { result } = renderHook(() => useSharedTransform())
+    const wipe = (side: 'a' | 'b') => (
+      <WipeViewer
+        urlA="/a.webp" urlB="/b.webp" badgeA="v1" badgeB="v3"
+        transform={result.current}
+        overlay={<div data-testid="wipe-overlay" />}
+        overlaySide={side}
+      />
+    )
+    const { rerender } = render(wipe('a'))
+    expect(screen.getByTestId('wipe-overlay').parentElement)
+      .toHaveStyle({ top: '100px', height: '300px' })
+
+    // Give side B a taller shape than side A — only a constraint bound to B's
+    // <img> can report it.
+    for (const [key, value] of Object.entries({
+      naturalWidth: 900, naturalHeight: 600, offsetWidth: 900, offsetHeight: 600, offsetTop: 0,
+    })) {
+      Object.defineProperty(screen.getByAltText('v3'), key, { value, configurable: true })
+    }
+    rerender(wipe('b'))
+
+    expect(screen.getByTestId('wipe-overlay').parentElement)
+      .toHaveStyle({ top: '0px', height: '600px' })
   })
 
   it('clips the overlay to the owning version’s half (A left of the divider, B right)', () => {
