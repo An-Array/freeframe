@@ -144,7 +144,7 @@ FreeFrame's Docker Compose includes PostgreSQL and Redis by default, but you can
 Works with: **AWS RDS, Google Cloud SQL, Supabase, Neon, DigitalOcean Managed DB, or any PostgreSQL 15+ instance.**
 
 1. Remove the `postgres` service and `pgdata` volume from `docker-compose.prod.yml`
-2. Remove `postgres` from the `depends_on` of the `api` and `worker` services
+2. Remove `postgres` from the `depends_on` of the `api`, `worker`, and `maintenance_worker` services
 3. In `.env.prod`, set `DATABASE_URL` to your external database:
    ```
    DATABASE_URL=postgresql://user:password@your-db-host:5432/freeframe
@@ -159,7 +159,7 @@ Works with: **AWS RDS, Google Cloud SQL, Supabase, Neon, DigitalOcean Managed DB
 Works with: **AWS ElastiCache, Upstash, Redis Cloud, DigitalOcean Managed Redis, or any Redis 7+ / Valkey instance.** Valkey is a drop-in Redis replacement and works out of the box.
 
 1. Remove the `redis` service and `redisdata` volume from `docker-compose.prod.yml`
-2. Remove `redis` from the `depends_on` of the `api`, `worker`, `email_worker`, and `beat` services
+2. Remove `redis` from the `depends_on` of the `api`, `worker`, `email_worker`, `maintenance_worker`, and `beat` services
 3. In `.env.prod`, set `REDIS_URL` to your external instance:
    ```
    REDIS_URL=redis://:password@your-redis-host:6379/0
@@ -262,6 +262,7 @@ All environment variables are documented in [`.env.example`](../.env.example). K
 | `API_WORKERS` | Gunicorn worker processes | `4` |
 | `TRANSCODING_CONCURRENCY` | Parallel transcoding jobs | `2` |
 | `EMAIL_CONCURRENCY` | Parallel email jobs | `2` |
+| `MAINTENANCE_CONCURRENCY` | Parallel housekeeping jobs | `1` |
 
 ---
 
@@ -288,6 +289,14 @@ Video transcoding is CPU-intensive. Adjust `TRANSCODING_CONCURRENCY` based on yo
 ### Email Workers
 
 Email sending is I/O-bound and lightweight. The default of `2` is sufficient for most deployments.
+
+### Maintenance Workers
+
+Housekeeping is I/O-bound but can run long: `cleanup_soft_deleted` deletes S3
+objects one at a time and `sweep_orphan_s3` lists the whole bucket. The default
+of `1` is right for most deployments, since these tasks are scheduled hourly at
+most and none of them is latency-sensitive. Raising it mainly helps if you have
+a large backlog of soft-deleted media to reclaim.
 
 ---
 
@@ -323,8 +332,41 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml logs --tail 100 a
 | Disk space | `df -h` | > 80% used |
 | Memory | `free -m` | Swap in use |
 | API response | `curl -s localhost/health` | Non-200 response |
-| Worker queue | `docker compose exec api celery -A tasks.celery_app inspect active` | Growing backlog |
-| Database connections | `docker compose exec postgres psql -U freeframe -c "SELECT count(*) FROM pg_stat_activity;"` | > 80% of max |
+| Queue depth | `docker compose --env-file .env.prod -f docker-compose.prod.yml exec redis sh -c 'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning LLEN transcoding'` (repeat for `email_high`, `email_low`, `maintenance`, `default`) | Any queue growing steadily; **any depth at all on `default`** |
+| Busy workers | `docker compose --env-file .env.prod -f docker-compose.prod.yml exec api celery -A apps.api.tasks.celery_app inspect active` | Tasks stuck for hours |
+| Database connections | `docker compose --env-file .env.prod -f docker-compose.prod.yml exec postgres psql -U freeframe -c "SELECT count(*) FROM pg_stat_activity;"` | > 80% of max |
+
+Check depth with `LLEN`, not `inspect active`. `inspect active` reports what
+connected workers are executing right now, so a queue that no worker subscribes
+to shows up as nothing at all: the workers are genuinely idle while the backlog
+grows unseen. That is exactly how [#240](https://github.com/Techiebutler/freeframe/issues/240)
+went unnoticed.
+
+`REDIS_PASSWORD` lives in `.env.prod`, which is not exported into your shell,
+so it has to expand inside the container. That is why the command above is
+wrapped in `sh -c '...'` with single quotes rather than passing `-a "$REDIS_PASSWORD"`
+directly, which would authenticate with an empty password.
+
+`default` should always be empty. Every task is routed explicitly, so anything
+landing there is a task that was added without a route and that no worker will
+ever run.
+
+### Queue Topology
+
+Each worker subscribes to an explicit `-Q` list, so a task whose queue has no
+subscriber is silently never executed. The shipped topology is:
+
+| Queue | Consumed by | Carries |
+|-------|-------------|---------|
+| `transcoding` | `worker` | Video/audio/image processing, metadata backfill, watermarking |
+| `email_high` | `email_worker` | Magic codes, invites |
+| `email_low` | `email_worker` | Mentions, comments, approvals, share notices |
+| `maintenance` | `maintenance_worker` | Retention GC, stale-upload reaper, orphan sweep |
+| `default` | nobody, by design | Should always be empty |
+
+If you add a task, route it in `apps/api/tasks/celery_app.py` to one of the
+consumed queues. `apps/api/tests/test_celery_queue_topology.py` fails if a
+registered task routes somewhere no compose worker consumes.
 
 ---
 
@@ -383,6 +425,66 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
 ```
 
 Database migrations run automatically on API startup. Always check the [CHANGELOG](../CHANGELOG.md) before updating.
+
+### Upgrading past the maintenance-queue fix ([#240](https://github.com/Techiebutler/freeframe/issues/240))
+
+Before this fix, no worker consumed the `default` queue, so the retention GC,
+the stale-upload reaper, the orphan sweeper, due-date reminders and
+`apply_watermark` were published and never executed. This release adds a
+`maintenance_worker` service, so **`docker compose up -d --build` alone is not
+enough: you must be using the updated compose file** for the new service to
+exist.
+
+Two things to do once, in this order.
+
+**1. Check what the first garbage-collection run will delete.** The GC has never
+run on your instance, so its first pass reclaims everything already past the
+retention window, all at once. Count it first, substituting your own
+`SOFT_DELETE_RETENTION_DAYS` for the `30` below:
+
+```bash
+docker compose --env-file .env.prod -f docker-compose.prod.yml exec postgres \
+  psql -U freeframe -c "
+WITH cutoff AS (SELECT now() - interval '30 days' AS t)
+SELECT 'projects'        AS root, count(*) FROM projects,        cutoff WHERE deleted_at < t
+UNION ALL SELECT 'folders',        count(*) FROM folders,        cutoff WHERE deleted_at < t
+UNION ALL SELECT 'assets',         count(*) FROM assets,         cutoff WHERE deleted_at < t
+UNION ALL SELECT 'asset_versions', count(*) FROM asset_versions, cutoff WHERE deleted_at < t
+UNION ALL SELECT 'comments',       count(*) FROM comments,       cutoff WHERE deleted_at < t
+UNION ALL SELECT 'share_links',    count(*) FROM share_links,    cutoff WHERE deleted_at < t
+UNION ALL SELECT 'live assets swept in with a deleted project/folder',
+       count(*) FROM assets a, cutoff
+       WHERE a.deleted_at IS NULL AND (
+         a.project_id IN (SELECT id FROM projects WHERE deleted_at < cutoff.t)
+         OR a.folder_id IN (SELECT id FROM folders WHERE deleted_at < cutoff.t));"
+```
+
+That last row is the one that surprises people. Deleting a project sets
+`deleted_at` on the project row only, and does **not** cascade to its assets, but
+the purge removes every asset belonging to a purged project or folder regardless
+of the asset's own `deleted_at`. So a project you trashed months ago still counts
+its live assets here even though they look untouched.
+
+If any of these numbers is larger than you expect, raise
+`SOFT_DELETE_RETENTION_DAYS` (or set it to `0` to keep the GC off) before
+starting the new worker, and lower it once you have reviewed what would go. The
+deletion is a hard delete with S3 reclaim and is not recoverable.
+
+**2. Drop the stale `default` backlog.** Instances that ran `beat` accumulated
+roughly 49 orphaned messages a day. The new worker consumes `maintenance`, not
+`default`, so the backlog is inert and safe to leave, but it wastes Redis
+memory:
+
+```bash
+docker compose exec redis redis-cli -a "$REDIS_PASSWORD" LLEN default
+docker compose exec redis redis-cli -a "$REDIS_PASSWORD" RENAME default default-old-240
+```
+
+`RENAME` rather than `DEL` so the messages can be inspected or restored. Delete
+`default-old-240` once the new worker is running and `LLEN maintenance` is
+draining normally.
+
+### Upgrading past the media-metadata fix ([#124](https://github.com/Techiebutler/freeframe/issues/124))
 
 If you're upgrading past the media-metadata fix ([#124](https://github.com/Techiebutler/freeframe/issues/124)), backfill missing `duration_seconds`/`width`/`height`/`fps` on already-processed files with: `docker exec freeframe-api-1 python -m apps.api.scripts.backfill_media_metadata`. The backfill runs as a Celery task on the `transcoding` queue, so it occupies one worker slot and can run long on large libraries (up to ~300s per file); new uploads keep transcoding normally on the remaining slots.
 
