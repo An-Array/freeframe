@@ -127,6 +127,78 @@ export async function uploadAllParts(
   return parts
 }
 
+/**
+ * Keeps the machine awake while an upload is running.
+ *
+ * An upload lives entirely in the browser tab. If the machine suspends
+ * mid-transfer the loop pushing chunks dies with it — and unlike a failed part,
+ * nothing runs afterwards: the `catch` that calls `/upload/abort` never
+ * executes, so the version is left at `processing_status = 'uploading'` and
+ * looks in the UI like a stalled transcode rather than a dead upload.
+ *
+ * Best-effort by design: without HTTPS, in low-power mode, or in a browser
+ * without the API there is no lock — none of which is a reason to refuse the
+ * upload.
+ *
+ * Reference-counted because several uploads can run at once; the lock is only
+ * released when the last one finishes.
+ */
+let wakeLock: WakeLockSentinel | null = null
+let wakeLockPending: Promise<void> | null = null
+let wakeLockHolders = 0
+
+function acquireWakeLock(): void {
+  // Dropping several files starts several uploads in the same tick, so this
+  // runs again long before the first request has resolved. Without the pending
+  // guard each one would request its own sentinel and only the last would be
+  // tracked, leaving the rest held for the life of the page.
+  if (wakeLock || wakeLockPending) return
+  if (typeof navigator === 'undefined' || !('wakeLock' in navigator)) return
+
+  wakeLockPending = (async () => {
+    try {
+      const sentinel = await navigator.wakeLock.request('screen')
+      if (wakeLockHolders === 0) {
+        // Every upload finished while the request was still in flight.
+        void sentinel.release().catch(() => {})
+        return
+      }
+      wakeLock = sentinel
+      // The browser drops the lock by itself when the tab is hidden.
+      sentinel.addEventListener('release', () => {
+        if (wakeLock === sentinel) wakeLock = null
+      })
+    } catch {
+      // Not having a wake lock is not an upload error.
+    } finally {
+      wakeLockPending = null
+    }
+  })()
+}
+
+/** Exported for tests. */
+export function retainWakeLock(): void {
+  wakeLockHolders += 1
+  acquireWakeLock()
+}
+
+/** Exported for tests. */
+export function releaseWakeLock(): void {
+  wakeLockHolders = Math.max(0, wakeLockHolders - 1)
+  if (wakeLockHolders > 0) return
+  const held = wakeLock
+  wakeLock = null
+  void held?.release().catch(() => {})
+}
+
+// Coming back to the foreground needs a fresh lock: the one dropped on hide is
+// dead and cannot be reused.
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && wakeLockHolders > 0) acquireWakeLock()
+  })
+}
+
 export type UploadStatus = 'pending' | 'uploading' | 'processing' | 'complete' | 'failed' | 'cancelled'
 
 export interface UploadFile {
@@ -279,6 +351,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
       let s3_key: string | undefined
       let version_id: string | undefined
 
+      retainWakeLock()
       try {
         updateFile(id, { status: 'uploading' })
 
@@ -333,6 +406,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
           api.post('/upload/abort', { s3_key, upload_id, version_id }).catch(() => {})
         }
       } finally {
+        releaseWakeLock()
         delete abortControllers[id]
       }
     })()
@@ -367,6 +441,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
       let upload_id: string | undefined
       let s3_key: string | undefined
       let version_id: string | undefined
+      retainWakeLock()
       try {
         updateFile(id, { status: 'uploading' })
         const initRes = await api.post<VersionInitiateResponse>(
@@ -401,6 +476,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
           api.post('/upload/abort', { s3_key, upload_id, version_id }).catch(() => {})
         }
       } finally {
+        releaseWakeLock()
         delete abortControllers[id]
       }
     })()
